@@ -26,6 +26,9 @@ from xgboost import XGBClassifier
 # For sparse handling in SHAP
 from scipy import sparse
 
+# AWS
+import boto3
+
 
 # -----------------------------
 # Config
@@ -42,10 +45,41 @@ TEST_SIZE = 0.2
 ARTIFACT_DIR = "artifacts"
 os.makedirs(ARTIFACT_DIR, exist_ok=True)
 
+S3_BUCKET = "victor-cardio-ml-artifacts"
+S3_PREFIX = "cardio-risk"
 
-# -----------------------------
+
+def upload_directory_to_s3(local_dir: str, bucket: str, prefix: str):
+    """
+    Upload all files in local_dir to s3://bucket/prefix/<relative_path>
+    """
+    s3 = boto3.client("s3")
+    for root, _, files in os.walk(local_dir):
+        for file in files:
+            full_path = os.path.join(root, file)
+            rel_path = os.path.relpath(full_path, local_dir)
+            s3_key = f"{prefix.rstrip('/')}/{rel_path}"
+            s3.upload_file(full_path, bucket, s3_key)
+            print(f"Uploaded: s3://{bucket}/{s3_key}")
+
+
+def upload_file_to_s3(local_path: str, bucket: str, key: str):
+    s3 = boto3.client("s3")
+    s3.upload_file(local_path, bucket, key)
+    print(f"Uploaded: s3://{bucket}/{key}")
+
+
+def report(name, y_true, proba, threshold=0.5):
+    pred = (proba >= threshold).astype(int)
+    print(f"\n=== {name} (threshold={threshold:.3f}) ===")
+    print("AUC:", roc_auc_score(y_true, proba))
+    print("F1:", f1_score(y_true, pred))
+    print("Precision:", precision_score(y_true, pred, zero_division=0))
+    print("Recall:", recall_score(y_true, pred, zero_division=0))
+    print("Confusion matrix:\n", confusion_matrix(y_true, pred))
+
+
 # DB connection
-# -----------------------------
 if DB_PASS:
     engine = create_engine(
         f"postgresql+psycopg2://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
@@ -70,8 +104,6 @@ num_cols = ["age", "trestbps", "chol", "thalach", "oldpeak", "chol_bp_ratio"]
 cat_cols = ["sex", "cp", "fbs", "restecg", "exang", "slope", "ca", "thal", "age_group", "bp_group"]
 
 # Preprocess
-# If you're on sklearn >= 1.2, you can set sparse_output=False to avoid sparse matrices:
-# OneHotEncoder(handle_unknown="ignore", sparse_output=False)
 preprocess = ColumnTransformer(
     transformers=[
         ("num", StandardScaler(), num_cols),
@@ -80,20 +112,8 @@ preprocess = ColumnTransformer(
     remainder="drop"
 )
 
-
-def report(name, y_true, proba, threshold=0.5):
-    pred = (proba >= threshold).astype(int)
-    print(f"\n=== {name} (threshold={threshold:.3f}) ===")
-    print("AUC:", roc_auc_score(y_true, proba))
-    print("F1:", f1_score(y_true, pred))
-    print("Precision:", precision_score(y_true, pred, zero_division=0))
-    print("Recall:", recall_score(y_true, pred, zero_division=0))
-    print("Confusion matrix:\n", confusion_matrix(y_true, pred))
-
-
-# -----------------------------
 # Logistic Regression baseline
-# -----------------------------
+
 logreg = Pipeline(
     steps=[
         ("prep", preprocess),
@@ -105,10 +125,7 @@ logreg.fit(X_train, y_train)
 proba_lr = logreg.predict_proba(X_test)[:, 1]
 report("Logistic Regression", y_test, proba_lr)
 
-
-# -----------------------------
 # XGBoost + RandomizedSearchCV
-# -----------------------------
 xgb = Pipeline(
     steps=[
         ("prep", preprocess),
@@ -159,9 +176,8 @@ proba_xgb = best_model.predict_proba(X_test)[:, 1]
 report("XGBoost (Tuned)", y_test, proba_xgb)
 
 
-# -----------------------------
-# Threshold tuning (maximize F1)
-# -----------------------------
+
+# Threshold tuning
 best_t = 0.5
 best_f1 = -1.0
 
@@ -169,15 +185,14 @@ for t in np.linspace(0.1, 0.9, 81):
     preds = (proba_xgb >= t).astype(int)
     f1 = f1_score(y_test, preds, zero_division=0)
     if f1 > best_f1:
-        best_f1 = f1
+        best_f1 = float(f1)
         best_t = float(t)
 
 print("\nBest threshold:", best_t)
 print("Best F1:", best_f1)
 
-# Results + false negatives
 results = X_test.copy()
-results["y_true"] = y_test  # safe index alignment
+results["y_true"] = y_test
 results["y_pred"] = (proba_xgb >= best_t).astype(int)
 
 false_negatives = results[(results["y_true"] == 1) & (results["y_pred"] == 0)]
@@ -188,15 +203,19 @@ if "age_group" in false_negatives.columns:
     print(false_negatives["age_group"].value_counts())
 
 
-# -----------------------------
-# SHAP (IMPORTANT: use fitted best_model)
-# -----------------------------
+# Run folder
+
+run_id = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+run_dir = os.path.join(ARTIFACT_DIR, f"run_id={run_id}")
+os.makedirs(run_dir, exist_ok=True)
+
+
+# SHAP (use fitted best_model)
 prep = best_model.named_steps["prep"]
 model = best_model.named_steps["clf"]
 
 X_test_enc = prep.transform(X_test)
 
-# Convert sparse -> dense for SHAP plotting
 if sparse.issparse(X_test_enc):
     X_test_enc_dense = X_test_enc.toarray()
 else:
@@ -207,11 +226,13 @@ feature_names = prep.get_feature_names_out()
 explainer = shap.TreeExplainer(model)
 shap_values = explainer.shap_values(X_test_enc_dense)
 
-# Some SHAP versions return list for binary classification
 if isinstance(shap_values, list):
     shap_values = shap_values[0]
 
-# Bar summary
+# Save SHAP plots INTO run_dir
+bar_path = os.path.join(run_dir, "shap_summary_bar.png")
+bee_path = os.path.join(run_dir, "shap_summary_beeswarm.png")
+
 plt.figure()
 shap.summary_plot(
     shap_values,
@@ -221,10 +242,9 @@ shap.summary_plot(
     show=False
 )
 plt.tight_layout()
-plt.savefig(os.path.join(ARTIFACT_DIR, "shap_summary_bar.png"), dpi=200)
+plt.savefig(bar_path, dpi=200)
 plt.close()
 
-# Beeswarm summary
 plt.figure()
 shap.summary_plot(
     shap_values,
@@ -233,11 +253,49 @@ shap.summary_plot(
     show=False
 )
 plt.tight_layout()
-plt.savefig(os.path.join(ARTIFACT_DIR, "shap_summary_beeswarm.png"), dpi=200)
+plt.savefig(bee_path, dpi=200)
 plt.close()
 
-print("Saved SHAP plots:",
-      os.path.join(ARTIFACT_DIR, "shap_summary_bar.png"),
-      os.path.join(ARTIFACT_DIR, "shap_summary_beeswarm.png"))
+print("Saved SHAP plots:", bar_path, bee_path)
 
+# Save artifacts (INTO run_dir)
 
+model_path = os.path.join(run_dir, "model.joblib")
+joblib.dump(best_model, model_path)
+
+threshold_path = os.path.join(run_dir, "threshold.json")
+with open(threshold_path, "w") as f:
+    json.dump({"best_threshold": best_t, "best_f1": best_f1}, f, indent=2)
+
+best_params_path = os.path.join(run_dir, "best_params.json")
+with open(best_params_path, "w") as f:
+    json.dump(search.best_params_, f, indent=2)
+
+metadata_path = os.path.join(run_dir, "metadata.json")
+with open(metadata_path, "w") as f:
+    json.dump(
+        {
+            "run_id": run_id,
+            "random_state": RANDOM_STATE,
+            "test_size": TEST_SIZE,
+            "cv": "StratifiedKFold(n_splits=5)",
+            "search": "RandomizedSearchCV(n_iter=30, scoring=roc_auc)",
+            "test_auc": float(roc_auc_score(y_test, proba_xgb)),
+            "threshold_best": best_t,
+            "threshold_best_f1": best_f1,
+            "false_negatives": int(len(false_negatives)),
+        },
+        f,
+        indent=2,
+    )
+
+print(f"\nSaved artifacts to: {run_dir}")
+run_prefix = f"{S3_PREFIX}/models/run_id={run_id}"
+upload_directory_to_s3(run_dir, S3_BUCKET, run_prefix)
+
+latest_prefix = f"{S3_PREFIX}/latest"
+upload_file_to_s3(model_path, S3_BUCKET, f"{latest_prefix}/model.joblib")
+upload_file_to_s3(threshold_path, S3_BUCKET, f"{latest_prefix}/threshold.json")
+upload_file_to_s3(metadata_path, S3_BUCKET, f"{latest_prefix}/metadata.json")
+
+print(f"\nUploaded run to s3://{S3_BUCKET}/{run_prefix}/ and updated latest/")

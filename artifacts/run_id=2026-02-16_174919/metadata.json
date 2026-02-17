@@ -1,0 +1,11 @@
+{
+  "run_id": "2026-02-16_174919",
+  "random_state": 42,
+  "test_size": 0.2,
+  "cv": "StratifiedKFold(n_splits=5)",
+  "search": "RandomizedSearchCV(n_iter=30, scoring=roc_auc)",
+  "test_auc": 0.9408482142857143,
+  "threshold_best": 0.35,
+  "threshold_best_f1": 0.8813559322033898,
+  "false_negatives": 2
+}
